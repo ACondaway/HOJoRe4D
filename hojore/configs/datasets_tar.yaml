@@ -1,0 +1,5 @@
+ARCTIC-TRAIN:
+    TYPE: ImageDataset
+    URLS: hojore_training_data/dataset_tars/arctic-train/{000000..0000009}.tar
+    ## 不懂啥意思
+    epoch_size: 130_240
