@@ -4,15 +4,13 @@ import argparse
 import os
 import cv2
 import numpy as np
-
 from hamer.configs import CACHE_DIR_HAMER
 from hamer.models import HAMER, download_models, load_hamer, DEFAULT_CHECKPOINT
 from hamer.utils import recursive_to
 from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hamer.utils.renderer import Renderer, cam_crop_to_full
-
 from vitpose_model import ViTPoseModel
-from rat_h import RelationAwareTokenization
+from rat_h import RelativeAttentionTokenization, get_dis_tok, get_overlapping_map
 
 def calculate_hand_bounding_boxes(j2d_r, j2d_l):
     def get_bbox_from_keypoints(keypoints):
@@ -33,39 +31,34 @@ def process_image(image_path):
     if image is None:
         raise ValueError(f"Image at {image_path} could not be loaded.")
 
-    # Use the ViTPose model for keypoint detection
     cpm = ViTPoseModel(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-
-    # Assuming a single person in the image for simplicity
     vitpose_results = cpm.predict_pose(image)
     if not vitpose_results:
         raise ValueError("No pose detected.")
 
-    # Extract right and left hand keypoints
     keypoints = vitpose_results[0]['keypoints']
-    j2d_right = keypoints[-21:]  # Right hand keypoints (assuming the model provides 21 keypoints per hand)
-    j2d_left = keypoints[-42:-21]  # Left hand keypoints
+    j2d_right = keypoints[-21:]
+    j2d_left = keypoints[-42:-21]
 
     bounding_boxes = calculate_hand_bounding_boxes(j2d_right, j2d_left)
 
-    img_size = image.shape[:2]
-    patch_size = 16  # Example patch size; adjust as needed
-    embed_dim = 64   # Example embedding dimension; adjust as needed
-    rat_model = RelationAwareTokenization(img_size[0], patch_size, embed_dim)
-    bounding_boxes_tensor = torch.tensor(bounding_boxes).float()
+    lefthand_p_map = np.mean(j2d_left, axis=0)  # Placeholder for position map calculation
+    righthand_p_map = np.mean(j2d_right, axis=0)  # Placeholder for position map calculation
 
-    patches = torch.zeros((1, patch_size, patch_size, 3))  # Placeholder for patches
-    relation_aware_tokens = rat_model(patches, bounding_boxes_tensor)
+    # Calculate the distance tokens and overlapping map
+    distok_R2L = get_dis_tok(lefthand_p_map, righthand_p_map, bounding_boxes)
+    distok_L2R = get_dis_tok(righthand_p_map, lefthand_p_map, bounding_boxes)
+    O_map = get_overlapping_map(np.mean(j2d_right, axis=0), bounding_boxes[1])
 
-    relative_distance_map = rat_model.calculate_relative_distance_map(
-        rat_model.calculate_position_maps(bounding_boxes_tensor, img_size[0], img_size[1], patches.device)[:, 0, :, :],
-        rat_model.calculate_position_maps(bounding_boxes_tensor, img_size[0], img_size[1], patches.device)[:, 1, :, :]
-    )
-    overlapping_map = rat_model.calculate_overlapping_map(bounding_boxes_tensor, img_size[0], img_size[1], patches.device)
+    # Initialize RAT model
+    rat_model = RelativeAttentionTokenization(input_dim=3, hidden_size=64, output_dim=32)
+    is_righthand = True  # Assuming we are processing the right hand
+
+    rat_tokens = rat_model(distok_R2L, distok_L2R, O_map, is_righthand)
 
     # Output the results
     output_image_with_bboxes(image, bounding_boxes)
-    save_maps(relative_distance_map, overlapping_map)
+    save_maps(distok_R2L, O_map)
 
 def output_image_with_bboxes(image, bounding_boxes):
     for bbox in bounding_boxes:
