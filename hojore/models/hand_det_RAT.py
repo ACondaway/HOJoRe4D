@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import torch
 import argparse
@@ -12,11 +11,12 @@ from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_S
 from hamer.utils.renderer import Renderer, cam_crop_to_full
 from vitpose_model import ViTPoseModel
 from rat_h import RelativeAttentionTokenization, get_dis_tok, get_overlapping_map
+from tqdm import tqdm
 
 from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
-from detectron2.engine import DefaultPredictor
-from detectron2.config import get_cfg
-from detectron2 import model_zoo
+# from detectron2.engine import DefaultPredictor
+# from detectron2.config import get_cfg
+# from detectron2 import model_zoo
 
 def calculate_hand_bounding_boxes(j2d_r, j2d_l):
     def get_bbox_from_keypoints(keypoints):
