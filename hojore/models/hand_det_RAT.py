@@ -12,6 +12,11 @@ from hamer.utils.renderer import Renderer, cam_crop_to_full
 from vitpose_model import ViTPoseModel
 from rat_h import RelativeAttentionTokenization, get_dis_tok, get_overlapping_map
 
+from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
+
 def calculate_hand_bounding_boxes(j2d_r, j2d_l):
     def get_bbox_from_keypoints(keypoints):
         min_pt = np.min(keypoints, axis=0)
@@ -30,6 +35,31 @@ def process_image(image_path):
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Image at {image_path} could not be loaded.")
+    # # Set up detectron2 for hand detection
+    # cfg = get_cfg()
+    # cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
+    # cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
+    # cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_50_FPN_3x/137849600/model_final_280758.pkl"
+    # predictor = DefaultPredictor(cfg)
+    # outputs = predictor(image)
+    from detectron2.config import LazyConfig
+    import hamer
+    cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
+    detectron2_cfg = LazyConfig.load(str(cfg_path))
+    detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+    for i in range(3):
+        detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
+    detector = DefaultPredictor_Lazy(detectron2_cfg)
+    outputs = detector(image)
+
+    # Filter predictions to only keep hands (you might need a custom model or label mapping)
+    pred_boxes = outputs["instances"].pred_boxes
+    pred_classes = outputs["instances"].pred_classes
+    hand_indices = [i for i, c in enumerate(pred_classes) if c == 1]  # Assuming '1' is the class for hands
+    hand_boxes = pred_boxes[hand_indices]
+
+    if len(hand_boxes) == 0:
+        raise ValueError("No hands detected.")
 
     cpm = ViTPoseModel(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     vitpose_results = cpm.predict_pose(image)
@@ -73,5 +103,5 @@ def save_maps(relative_distance_map, overlapping_map):
     np.save("overlapping_map.npy", overlapping_map.cpu().numpy())
 
 if __name__ == "__main__":
-    image_path = "input_image.jpg"  # Replace with your image path
+    image_path = "/home/sjtu/eccv_workspace/hold/generator/hand_detector.d2/viz/input.jpg"  # Replace with your image path
     process_image(image_path)
