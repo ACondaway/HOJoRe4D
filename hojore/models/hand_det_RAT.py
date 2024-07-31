@@ -143,8 +143,8 @@ def output_image_with_bboxes(image, bounding_boxes):
     cv2.imwrite("output_image_with_bboxes.jpg", image)
 
 def save_maps(relative_distance_map, overlapping_map):
-    np.save("relative_distance_map.npy", relative_distance_map.cpu().numpy())
-    np.save("overlapping_map.npy", overlapping_map.cpu().numpy())
+    np.save("relative_distance_map.npy", relative_distance_map)
+    np.save("overlapping_map.npy", overlapping_map)
 
 if __name__ == "__main__":
     image_path = "/home/sjtu/eccv_workspace/hold/generator/hand_detector.d2/viz/input.jpg"  # Replace with your image path
