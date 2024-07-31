@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import torch
 import argparse
@@ -31,17 +32,38 @@ def calculate_hand_bounding_boxes(j2d_r, j2d_l):
     bbox_l = get_bbox_from_keypoints(j2d_l)
     return np.array([bbox_r, bbox_l])
 
+def get_position_map(bbox, H=256, W=256):
+    cx, cy, sx, sy = bbox
+    C = np.zeros((H, W, 2))
+    for i in range(W):
+        for j in range(H):
+            C[j, i] = [cx + (2*i - W) * sx / (2*W), cy + (2*j - H) * sy / (2*H)]
+    return C
+
+def get_relative_distance_map(pos_map_left, pos_map_right, bbox_scale, tau=0.5):
+    rel_distance = tau * (pos_map_right - pos_map_left) / bbox_scale
+    return torch.sigmoid(torch.tensor(rel_distance))
+
+def inside(patch, Bbox):
+    edge_x = Bbox[0] - Bbox[2] / 2, Bbox[0] + Bbox[2] / 2
+    edge_y = Bbox[1] - Bbox[3] / 2, Bbox[1] + Bbox[3] / 2
+    return int(edge_x[0] < patch[0] < edge_x[1] and edge_y[0] < patch[1] < edge_y[1])
+
+def get_overlapping_map(pos_map, bbox):
+    H, W, _ = pos_map.shape
+    O_map = np.zeros((H, W))
+    for i in range(W):
+        for j in range(H):
+            O_map[j, i] = inside(pos_map[j, i], bbox)
+    return O_map
+
+
 def process_image(image_path):
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Image at {image_path} could not be loaded.")
-    # # Set up detectron2 for hand detection
-    # cfg = get_cfg()
-    # cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
-    # cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-    # cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_50_FPN_3x/137849600/model_final_280758.pkl"
-    # predictor = DefaultPredictor(cfg)
-    # outputs = predictor(image)
+
+    #detector = load_hamer(DEFAULT_CHECKPOINT)
     from detectron2.config import LazyConfig
     import hamer
     cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
@@ -50,45 +72,67 @@ def process_image(image_path):
     for i in range(3):
         detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
     detector = DefaultPredictor_Lazy(detectron2_cfg)
-    outputs = detector(image)
-
-    # Filter predictions to only keep hands (you might need a custom model or label mapping)
-    pred_boxes = outputs["instances"].pred_boxes
-    pred_classes = outputs["instances"].pred_classes
-    hand_indices = [i for i, c in enumerate(pred_classes) if c == 1]  # Assuming '1' is the class for hands
-    hand_boxes = pred_boxes[hand_indices]
-
-    if len(hand_boxes) == 0:
-        raise ValueError("No hands detected.")
-
     cpm = ViTPoseModel(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    vitpose_results = cpm.predict_pose(image)
-    if not vitpose_results:
-        raise ValueError("No pose detected.")
 
-    keypoints = vitpose_results[0]['keypoints']
-    j2d_right = keypoints[-21:]
-    j2d_left = keypoints[-42:-21]
+    img_paths = [image_path]
+    for img_path in tqdm(img_paths):
+        img_cv2 = cv2.imread(str(img_path))
 
-    bounding_boxes = calculate_hand_bounding_boxes(j2d_right, j2d_left)
+        # Detect humans in image
+        det_out = detector(img_cv2)
+        img = img_cv2.copy()[:, :, ::-1]
 
-    lefthand_p_map = np.mean(j2d_left, axis=0)  # Placeholder for position map calculation
-    righthand_p_map = np.mean(j2d_right, axis=0)  # Placeholder for position map calculation
+        det_instances = det_out['instances']
+        valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > 0.5)
+        pred_bboxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
+        pred_scores = det_instances.scores[valid_idx].cpu().numpy()
 
-    # Calculate the distance tokens and overlapping map
-    distok_R2L = get_dis_tok(lefthand_p_map, righthand_p_map, bounding_boxes)
-    distok_L2R = get_dis_tok(righthand_p_map, lefthand_p_map, bounding_boxes)
-    O_map = get_overlapping_map(np.mean(j2d_right, axis=0), bounding_boxes[1])
+        # Detect human keypoints for each person
+        vitposes_out = cpm.predict_pose(
+            img_cv2,
+            [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)],
+        )
 
-    # Initialize RAT model
-    rat_model = RelativeAttentionTokenization(input_dim=3, hidden_size=64, output_dim=32)
-    is_righthand = True  # Assuming we are processing the right hand
+        bboxes = []
+        is_right = []
 
-    rat_tokens = rat_model(distok_R2L, distok_L2R, O_map, is_righthand)
+        # Use hands based on hand keypoint detections
+        for vitposes in vitposes_out:
+            left_hand_keyp = vitposes['keypoints'][-42:-21]
+            right_hand_keyp = vitposes['keypoints'][-21:]
 
-    # Output the results
-    output_image_with_bboxes(image, bounding_boxes)
-    save_maps(distok_R2L, O_map)
+            # Rejecting not confident detections
+            keyp = left_hand_keyp
+            valid = keyp[:, 2] > 0.5
+            if sum(valid) > 3:
+                bbox = [keyp[valid, 0].min(), keyp[valid, 1].min(), keyp[valid, 0].max(), keyp[valid, 1].max()]
+                bboxes.append(bbox)
+                is_right.append(0)
+            keyp = right_hand_keyp
+            valid = keyp[:, 2] > 0.5
+            if sum(valid) > 3:
+                bbox = [keyp[valid, 0].min(), keyp[valid, 1].min(), keyp[valid, 0].max(), keyp[valid, 1].max()]
+                bboxes.append(bbox)
+                is_right.append(1)
+
+        if len(bboxes) == 0:
+            continue
+
+        boxes = np.stack(bboxes)
+        right = np.stack(is_right)
+
+        # Calculating the relative distance map and overlapping map
+        lefthand_bbox = boxes[0]
+        righthand_bbox = boxes[1]
+
+        lefthand_p_map = get_position_map(lefthand_bbox)
+        righthand_p_map = get_position_map(righthand_bbox)
+
+        relative_distance_map = get_relative_distance_map(lefthand_p_map, righthand_p_map, [lefthand_bbox[2], lefthand_bbox[3]])
+        overlapping_map = get_overlapping_map(righthand_p_map, lefthand_bbox)
+
+        output_image_with_bboxes(image, boxes)
+        save_maps(relative_distance_map, overlapping_map)
 
 def output_image_with_bboxes(image, bounding_boxes):
     for bbox in bounding_boxes:
