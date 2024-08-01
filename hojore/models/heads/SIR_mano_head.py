@@ -122,6 +122,12 @@ class MANOTransformerDecoderHead(nn.Module):
                             'hand_pose': pred_hand_pose[:, 1:],
                             'betas': pred_betas}
         
+        # Convert self.joint_rep_type -> rotmat
+        joint_conversion_fn = {
+            '6d': rot6d_to_rotmat,
+            'aa': lambda x: aa_to_rotmat(x.view(-1, 3).contiguous())
+        }[self.joint_rep_type]
+        
         pred_mano_params_list = {}
         pred_mano_params_list['hand_pose'] = torch.cat([joint_conversion_fn(pbp).view(batch_size, -1, 3, 3)[:, 1:, :, :] for pbp in pred_hand_pose_list], dim=0)
         pred_mano_params_list['betas'] = torch.cat(pred_betas_list, dim=0)
