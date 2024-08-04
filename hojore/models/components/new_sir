@@ -1,0 +1,64 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertModel
+
+class SelfAttentionTransformer(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_heads, num_layers):
+        super(SelfAttentionTransformer, self).__init__()
+        self.self_attention = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads)
+        self.layers = nn.ModuleList(
+            [nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim) for _ in range(num_layers)]
+        )
+        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim), num_layers=num_layers)
+        
+    def forward(self, x):
+        x = x.permute(1, 0, 2)  # [batch_size, seq_len, feature_dim] -> [seq_len, batch_size, feature_dim]
+        for layer in self.layers:
+            x = layer(x)
+        return x.permute(1, 0, 2)  # [seq_len, batch_size, feature_dim] -> [batch_size, seq_len, feature_dim]
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_heads, num_layers, output_dim):
+        super(TransformerDecoder, self).__init__()
+        self.transformer_decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim), num_layers=num_layers)
+        self.fc = nn.Linear(input_dim, output_dim)
+    
+    def forward(self, x):
+        x = x.permute(1, 0, 2)  # [batch_size, seq_len, feature_dim] -> [seq_len, batch_size, feature_dim]
+        x = self.transformer_decoder(x, x)
+        x = self.fc(x)
+        return x.permute(1, 0, 2)  # [seq_len, batch_size, feature_dim] -> [batch_size, seq_len, feature_dim]
+
+class SIR(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_heads, num_layers, output_dim):
+        super(SIR, self).__init__()
+        self.self_attention_transformer = SelfAttentionTransformer(input_dim, hidden_dim, num_heads, num_layers)
+        self.transformer_decoder = TransformerDecoder(input_dim, hidden_dim, num_heads, num_layers, output_dim)
+        
+    def forward(self, M):
+        # M is the input tensor of shape [batch_size, 2HW, C]
+        attention_output = self.self_attention_transformer(M)
+        global_feature = self.transformer_decoder(attention_output)
+        return global_feature
+
+# Hyperparameters
+H = 16
+W = 12
+C = 1280
+input_dim = C
+hidden_dim = 512
+num_heads = 8
+num_layers = 6
+output_dim = C
+
+# Create an instance of the SIR module
+sir = SIR(input_dim, hidden_dim, num_heads, num_layers, output_dim)
+
+# Example input tensor M*
+batch_size = 4
+M_star = torch.randn(batch_size, 2*H*W, C)
+
+# Forward pass through the SIR module
+G = sir(M_star)
+print(G.shape)  # Expected output shape: [batch_size, 2*H*W, C]
