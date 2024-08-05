@@ -1,0 +1,121 @@
+import os
+import subprocess
+import numpy as np
+import trimesh
+import cv2
+
+def run_colmap(image_folder, output_folder):
+    os.makedirs(output_folder, exist_ok=True)
+    database_path = os.path.join(output_folder, 'database.db')
+    sparse_folder = os.path.join(output_folder, 'sparse')
+    dense_folder = os.path.join(output_folder, 'dense')
+    os.makedirs(sparse_folder, exist_ok=True)
+    os.makedirs(dense_folder, exist_ok=True)
+
+    # Feature extraction
+    subprocess.run([
+        'colmap', 'feature_extractor',
+        '--database_path', database_path,
+        '--image_path', image_folder,
+        '--ImageReader.single_camera', '1'
+    ])
+
+    # Feature matching
+    subprocess.run([
+        'colmap', 'exhaustive_matcher',
+        '--database_path', database_path
+    ])
+
+    # Structure from Motion (SfM)
+    subprocess.run([
+        'colmap', 'mapper',
+        '--database_path', database_path,
+        '--image_path', image_folder,
+        '--output_path', sparse_folder
+    ])
+
+    # Convert model to PLY
+    subprocess.run([
+        'colmap', 'model_converter',
+        '--input_path', os.path.join(sparse_folder, '0'),
+        '--output_path', os.path.join(sparse_folder, '0'),
+        '--output_type', 'PLY'
+    ])
+
+    # Dense reconstruction
+    subprocess.run([
+        'colmap', 'image_undistorter',
+        '--image_path', image_folder,
+        '--input_path', os.path.join(sparse_folder, '0'),
+        '--output_path', dense_folder,
+        '--output_type', 'COLMAP',
+        '--max_image_size', '2000'
+    ])
+
+    subprocess.run([
+        'colmap', 'patch_match_stereo',
+        '--workspace_path', dense_folder,
+        '--workspace_format', 'COLMAP',
+        '--PatchMatchStereo.geom_consistency', 'true'
+    ])
+
+    subprocess.run([
+        'colmap', 'stereo_fusion',
+        '--workspace_path', dense_folder,
+        '--workspace_format', 'COLMAP',
+        '--input_type', 'geometric',
+        '--output_path', os.path.join(dense_folder, 'fused.ply')
+    ])
+
+def load_point_cloud(filepath):
+    mesh = trimesh.load(filepath, process=False)
+    vertices = np.array(mesh.vertices)
+    return vertices
+
+def get_bounding_box(vertices):
+    bbox_min = np.min(vertices, axis=0)
+    bbox_max = np.max(vertices, axis=0)
+    return bbox_min, bbox_max
+
+def draw_bounding_box(image_path, bbox_min, bbox_max, output_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Image not found at {image_path}")
+
+    # Draw the bounding box as a rectangle
+    x_min, y_min, z_min = bbox_min
+    x_max, y_max, z_max = bbox_max
+
+    # Assuming the bounding box coordinates are within image bounds for simplicity
+    cv2.rectangle(image, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 255, 0), 2)
+
+    # Save the output image
+    cv2.imwrite(output_path, image)
+    print(f"Output image with bounding box saved to {output_path}")
+
+def main(image_folder, output_folder, sample_image_path, output_image_path):
+    # Run COLMAP to process the image folder and generate point cloud
+    run_colmap(image_folder, output_folder)
+    
+    # Load the generated point cloud
+    point_cloud_path = os.path.join(output_folder, 'dense', 'fused.ply')
+    vertices = load_point_cloud(point_cloud_path)
+    
+    # Compute bounding box
+    bbox_min, bbox_max = get_bounding_box(vertices)
+    
+    # Draw bounding box on a sample image
+    draw_bounding_box(sample_image_path, bbox_min, bbox_max, output_image_path)
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Process images with COLMAP and extract bounding box for an object.")
+    parser.add_argument("image_folder", type=str, help="Path to the folder containing input images")
+    parser.add_argument("output_folder", type=str, help="Path to the folder to store COLMAP outputs")
+    parser.add_argument("sample_image_path", type=str, help="Path to a sample image to draw the bounding box")
+    parser.add_argument("output_image_path", type=str, help="Path to save the output image with bounding box")
+
+    args = parser.parse_args()
+    
+    main(args.image_folder, args.output_folder, args.sample_image_path, args.output_image_path)
