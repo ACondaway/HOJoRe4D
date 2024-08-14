@@ -2,6 +2,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def sir(cfg):
+    return SIR(
+        input_dim=cfg.MODEL.SIR.INPUT_DIM,
+        hidden_dim=cfg.MODEL.SIR.HIDDEN_SIZE,
+        num_heads=cfg.MODEL.SIR.NUM_HEADS,
+        num_layers=cfg.MODEL.SIR.NUM_LAYERS,
+        output_dim=cfg.MODEL.SIR.OUTPUT_DIM,
+    )
+
+def initialize_sir_parameters(m):
+    if isinstance(m, nn.Linear):
+        # Xavier initialization for linear layers
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Conv2d):
+        # Kaiming initialization for convolutional layers
+        nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.LayerNorm):
+        # Initialize LayerNorm with ones for weight and zeros for bias
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.MultiheadAttention):
+        # Xavier initialization for attention layers
+        nn.init.xavier_uniform_(m.in_proj_weight)
+        nn.init.xavier_uniform_(m.out_proj.weight)
+        if m.in_proj_bias is not None:
+            nn.init.zeros_(m.in_proj_bias)
+        if m.out_proj.bias is not None:
+            nn.init.zeros_(m.out_proj.bias)
+
 class SelfAttentionTransformer(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_heads, num_layers):
         super(SelfAttentionTransformer, self).__init__()
@@ -55,23 +88,23 @@ class SIR(nn.Module):
         
         return integrated_features
 
-# 超参数
-H = 16
-W = 12
-C = 1280
-input_dim = C
-hidden_dim = 512
-num_heads = 8
-num_layers = 6
-output_dim = C
+# # 超参数
+# H = 16
+# W = 12
+# C = 1280
+# input_dim = C
+# hidden_dim = 512
+# num_heads = 8
+# num_layers = 6
+# output_dim = C
 
-# 创建 SIR 模块实例
-sir = SIR(input_dim, hidden_dim, num_heads, num_layers, output_dim)
+# # 创建 SIR 模块实例
+# sir = SIR(input_dim, hidden_dim, num_heads, num_layers, output_dim)
 
-# 示例输入张量 M
-batch_size = 4
-M = torch.randn(batch_size, 2*H*W, C)  # 示例输入
+# # 示例输入张量 M
+# batch_size = 4
+# M = torch.randn(batch_size, 2*H*W, C)  # 示例输入
 
-# 通过 SIR 模块的前向传递
-integrated_features = sir(M)
-print(integrated_features.shape)  # 预期输出形状：[batch_size, 2*H*W, C]
+# # 通过 SIR 模块的前向传递
+# integrated_features = sir(M)
+# print(integrated_features.shape)  # 预期输出形状：[batch_size, 2*H*W, C]
