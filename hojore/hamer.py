@@ -311,11 +311,13 @@ class HAMER(pl.LightningModule):
         rh_cropped_img_tensor = rh_cropped_img_tensor.to(device)
         # Pass the tensors to the backbone
         lh_cond_feats = self.backbone(lh_cropped_img_tensor)
+        lh_cond_feats = torch.tensor(lh_cond_feats).permute(0, 2, 3, 1).float()
         lh_cond_feats = lh_cond_feats.to(device)
-        print(f'lh_cond_feats shape{lh_cond_feats.shape}')
+        print(f'lh_cond_feats shape:{lh_cond_feats.shape}')
         rh_cond_feats = self.backbone(rh_cropped_img_tensor)
+        rh_cond_feats = torch.tensor(rh_cond_feats).permute(0, 2, 3, 1).float()
         rh_cond_feats = rh_cond_feats.to(device)
-        print(f'rh_cond_feats shape{rh_cond_feats.shape}')
+        print(f'rh_cond_feats shape:{rh_cond_feats.shape}')
         # rh_cond_feats = self.backbone(rh_cropped_img[:, :, :, :])
         # lh_cond_feats = self.backbone(lh_cropped_img[:, :, :, :])
 
@@ -334,14 +336,18 @@ class HAMER(pl.LightningModule):
         lh_all_feats = lh_all_feats.to(device)
         print(f'shape of lh all feats:{lh_all_feats.shape}')
         # Flatten the concatenated features along the specified dimensions
-        rh_flatten_feats = torch.flatten(rh_all_feats, start_dim=0, end_dim=1)
-        rh_flatten_feats = rh_flatten_feats.to(device)
-        print(f'shape of rh flatten feats:{rh_flatten_feats.shape}')
-        lh_flatten_feats = torch.flatten(lh_all_feats, start_dim=0, end_dim=1)
-        lh_flatten_feats = lh_flatten_feats.to(device)
-        print(f'shape of lh flatten feats:{lh_flatten_feats.shape}')
+        # rh_flatten_feats = torch.flatten(rh_all_feats, start_dim=0, end_dim=1)
+        # rh_flatten_feats = rh_flatten_feats.to(device)
+        # print(f'shape of rh flatten feats:{rh_flatten_feats.shape}')
+        # lh_flatten_feats = torch.flatten(lh_all_feats, start_dim=0, end_dim=1)
+        # lh_flatten_feats = lh_flatten_feats.to(device)
+        # print(f'shape of lh flatten feats:{lh_flatten_feats.shape}')
         # Concatenate the flattened features along the batch dimension (axis 0)
-        ult_feats = torch.concat((rh_flatten_feats, lh_flatten_feats), dim=0)
+        # ult_feats = torch.concat((rh_flatten_feats, lh_flatten_feats), dim=0)
+        B, H, W, C = rh_all_feats.shape
+        rh_all_feats = rh_all_feats.view(B, H * W, C)
+        lh_all_feats = lh_all_feats.view(B, H * W, C)
+        ult_feats = torch.concat((rh_all_feats, lh_all_feats), dim=1)
         print(f'shape of ult feats:{ult_feats.shape}')
         breakpoint()
         """
@@ -349,6 +355,7 @@ class HAMER(pl.LightningModule):
         """
 
         sir_token = self.sir(ult_feats)
+        print(f'sir token shape:{sir_token.shape}')
         pred_mano_params, pred_cam, _ = self.mano_head(sir_token)
 
 
