@@ -143,8 +143,14 @@ class HAMER(pl.LightningModule):
         # original_image = batch['img_og']
         # Compute conditioning features using the backbone
         # if using ViT backbone, we need to use a different aspect ratio
+        # x = batch['img']
+        # print(f'x type{x.type}')
+        # print(f'x shape{x.shape}')
+        # print(f'vit input shape{x[:,:,:,32:-32].shape}')
         # conditioning_feats = self.backbone(x[:,:,:,32:-32])
-
+        # print(f'conditioning feats type{conditioning_feats.type}')
+        # print(f'conditioning feats shape{conditioning_feats.shape}')
+        # breakpoint()
         # pred_mano_params, pred_cam, _ = self.mano_head(conditioning_feats)
         lh_cropped_img = []
         rh_cropped_img = []
@@ -200,6 +206,8 @@ class HAMER(pl.LightningModule):
             # lh_cropped_img.append(lh_cropped_img_tmp)
             # rh_cropped_img.append(rh_cropped_img_tmp)
             # Check if the left-hand image is not empty
+            target_size = (256, 192)
+            blank_image = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)  # Create a blank image
             if lh_cropped_img_tmp is not None and lh_cropped_img_tmp.size > 0:
                 # Save the left-hand image
                 lh_image_path = os.path.join(output_dir, "left_hand.jpg")
@@ -208,7 +216,8 @@ class HAMER(pl.LightningModule):
                 print(f"Left hand image shape: {lh_cropped_img_tmp.shape}")
                 lh_cropped_img.append(lh_cropped_img_tmp)
             else:
-                print("Left hand image is empty or not detected.")
+                print("Left hand image is empty or not detected.Adding a blank image.")
+                lh_cropped_img.append(blank_image)
 
             # Check if the right-hand image is not empty
             if rh_cropped_img_tmp is not None and rh_cropped_img_tmp.size > 0:
@@ -219,12 +228,15 @@ class HAMER(pl.LightningModule):
                 print(f"Right hand image shape: {rh_cropped_img_tmp.shape}")
                 rh_cropped_img.append(rh_cropped_img_tmp)
             else:
-                print("Right hand image is empty or not detected.")
+                print("Right hand image is empty or not detected.Adding a blank image.")
+                rh_cropped_img.append(blank_image)
 
             # Optionally handle the case where both are empty
             if (lh_cropped_img_tmp is None or lh_cropped_img_tmp.size == 0) and \
             (rh_cropped_img_tmp is None or rh_cropped_img_tmp.size == 0):
                 print("Both left-hand and right-hand images are empty or not detected.")
+                lh_cropped_img.append(blank_image)
+                rh_cropped_img.append(blank_image)
             # rat_x = np.squeeze(image_np, axis=0)
             rat_x = image_np.copy()
             print(f"rat_x shape{rat_x.shape}")
@@ -264,20 +276,19 @@ class HAMER(pl.LightningModule):
         else:
             # Handle the case where no left-hand features are found
             lh_rat_feats = torch.empty((0, *expected_feature_shape), dtype=torch.float32)
-
+        print(f'rh rat feats shape:{rh_rat_feats.shape}')
+        print(f'lh rat feats shape:{lh_rat_feats.shape}')
         # use circulation method to gain the batch RAT
         # convert np.array to tensor(same as img_patch) and then pass through vit backbone
         # Convert to PyTorch tensors
         print(f'lh_cropped_img shape{lh_cropped_img.shape}')
         print(f'rh_cropped_img shape{rh_cropped_img.shape}')
-        lh_cropped_img_tensor = torch.tensor(lh_cropped_img).permute(0, 3, 1, 2).float()  # Change from (batch, height, width, channels) to (batch, channels, height, width)
-        rh_cropped_img_tensor = torch.tensor(rh_cropped_img).permute(0, 3, 1, 2).float()  # Same conversion
+        lh_cropped_img_tensor = torch.tensor(lh_cropped_img).permute(0, 3, 2, 1).float()  # Change from (batch, height, width, channels) to (batch, channels, height, width)
+        rh_cropped_img_tensor = torch.tensor(rh_cropped_img).permute(0, 3, 2, 1).float()  # Same conversion
         print(f'lh_cropped_img_tensor shape{lh_cropped_img_tensor.shape}')
         print(f'rh_cropped_img_tensor shape{rh_cropped_img_tensor.shape}')
-        breakpoint()
-        # Convert to float16 if using mixed precision
-        lh_cropped_img_tensor = lh_cropped_img_tensor.to(torch.float16)
-        rh_cropped_img_tensor = rh_cropped_img_tensor.to(torch.float16)
+        # breakpoint()
+
         # Normalize the tensors if required
         # Assuming mean and std normalization values are already defined
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -285,23 +296,58 @@ class HAMER(pl.LightningModule):
 
         lh_cropped_img_tensor = (lh_cropped_img_tensor / 255.0 - mean) / std
         rh_cropped_img_tensor = (rh_cropped_img_tensor / 255.0 - mean) / std
+        # Convert to float16 if using mixed precision
+        # lh_cropped_img_tensor = lh_cropped_img_tensor.to(torch.float16)
+        # rh_cropped_img_tensor = rh_cropped_img_tensor.to(torch.float16)
+        lh_cropped_img_tensor = lh_cropped_img_tensor.half()
+        rh_cropped_img_tensor = rh_cropped_img_tensor.half()
 
+        # Determine the device: Use GPU if available, otherwise CPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Move model and tensor to the device
+        self.backbone = self.backbone.to(device)
+        lh_cropped_img_tensor = lh_cropped_img_tensor.to(device)
+        rh_cropped_img_tensor = rh_cropped_img_tensor.to(device)
         # Pass the tensors to the backbone
         lh_cond_feats = self.backbone(lh_cropped_img_tensor)
+        lh_cond_feats = lh_cond_feats.to(device)
         print(f'lh_cond_feats shape{lh_cond_feats.shape}')
         rh_cond_feats = self.backbone(rh_cropped_img_tensor)
+        rh_cond_feats = rh_cond_feats.to(device)
         print(f'rh_cond_feats shape{rh_cond_feats.shape}')
         # rh_cond_feats = self.backbone(rh_cropped_img[:, :, :, :])
         # lh_cond_feats = self.backbone(lh_cropped_img[:, :, :, :])
 
-        rh_all_feats = torch.concat(rh_cond_feats, rh_rat_feats, axis = -1)
-        lh_all_feats = torch.concat(lh_cond_feats, lh_rat_feats, axis = -1)
+        # rh_all_feats = torch.concat(rh_cond_feats, rh_rat_feats, axis = -1)
+        # lh_all_feats = torch.concat(lh_cond_feats, lh_rat_feats, axis = -1)
+        # rh_flatten_feats = torch.flatten(rh_all_feats, start_dim=0, end_dim=1)
+        # lh_flatten_feats = torch.flatten(lh_all_feats, start_dim=0, end_dim=1)
+        # ult_feats = torch.concat(rh_flatten_feats, lh_flatten_feats, axis = 0)
+        # Concatenate the tensors along the last dimension
+        rh_rat_feats = rh_rat_feats.to(device)
+        rh_all_feats = torch.concat((rh_cond_feats, rh_rat_feats), dim=-1)
+        rh_all_feats = rh_all_feats.to(device)
+        print(f'shape of rh all feats:{rh_all_feats.shape}')
+        lh_rat_feats = lh_rat_feats.to(device)
+        lh_all_feats = torch.concat((lh_cond_feats, lh_rat_feats), dim=-1)
+        lh_all_feats = lh_all_feats.to(device)
+        print(f'shape of lh all feats:{lh_all_feats.shape}')
+        # Flatten the concatenated features along the specified dimensions
         rh_flatten_feats = torch.flatten(rh_all_feats, start_dim=0, end_dim=1)
+        rh_flatten_feats = rh_flatten_feats.to(device)
+        print(f'shape of rh flatten feats:{rh_flatten_feats.shape}')
         lh_flatten_feats = torch.flatten(lh_all_feats, start_dim=0, end_dim=1)
-        ult_feats = torch.concat(rh_flatten_feats, lh_flatten_feats, axis = 0)
+        lh_flatten_feats = lh_flatten_feats.to(device)
+        print(f'shape of lh flatten feats:{lh_flatten_feats.shape}')
+        # Concatenate the flattened features along the batch dimension (axis 0)
+        ult_feats = torch.concat((rh_flatten_feats, lh_flatten_feats), dim=0)
+        print(f'shape of ult feats:{ult_feats.shape}')
+        breakpoint()
         """
         The Ultimate features keeps the dimension of 768*2560
         """
+
         sir_token = self.sir(ult_feats)
         pred_mano_params, pred_cam, _ = self.mano_head(sir_token)
 
