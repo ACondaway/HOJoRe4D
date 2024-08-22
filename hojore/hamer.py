@@ -136,134 +136,93 @@ class HAMER(pl.LightningModule):
 
         # Use RGB image as input
         images = batch['jpg']
-        print(f'images type: {images.type}')
-        print(f'images shape: {images.shape}')
+        lh_box = batch['lh_bbox']
+        # lh_box = torch.stack(lh_box)  # Convert to a single tensor
+        print(f'batch lh box list: {lh_box}')
+        rh_box = batch['rh_bbox']
+        # rh_box = torch.stack(rh_box)  # Convert to a single tensor
+        print(f'batch rh box list: {rh_box}')
+        # print(f'images type: {images.type}')
+        # print(f'images shape: {images.shape}')
         batch_size = images.shape[0]
-        # batch_size = batch['img_og'].shape[0]
-        # original_image = batch['img_og']
-        # Compute conditioning features using the backbone
-        # if using ViT backbone, we need to use a different aspect ratio
-        # x = batch['img']
-        # print(f'x type{x.type}')
-        # print(f'x shape{x.shape}')
-        # print(f'vit input shape{x[:,:,:,32:-32].shape}')
-        # conditioning_feats = self.backbone(x[:,:,:,32:-32])
-        # print(f'conditioning feats type{conditioning_feats.type}')
-        # print(f'conditioning feats shape{conditioning_feats.shape}')
-        # breakpoint()
-        # pred_mano_params, pred_cam, _ = self.mano_head(conditioning_feats)
-        lh_cropped_img = []
-        rh_cropped_img = []
+        # Determine the device: Use GPU if available, otherwise CPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 获取左手和右手裁剪图像
+        lh_cropped_img = batch['lh_cropped_img']
+        print(f'lh cropped img batch shape:{lh_cropped_img.shape}')
+        rh_cropped_img = batch['rh_cropped_img']
+        print(f'rh cropped img batch shape:{rh_cropped_img.shape}')
+
+        # 如果左手裁剪图像为空，则跳过对其的处理
+        if lh_cropped_img.shape[1] > 0:
+            lh_cropped_img_tensor = torch.tensor(lh_cropped_img).permute(0, 3, 2, 1).float().to(device)
+            lh_cropped_img_tensor = (lh_cropped_img_tensor / 255.0 - torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)) / torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+            lh_cropped_img_tensor = lh_cropped_img_tensor.half()
+
+            # 提取左手特征
+            lh_cond_feats = self.backbone(lh_cropped_img_tensor)
+            lh_cond_feats = lh_cond_feats.permute(0, 2, 3, 1).float()
+            print(f'lh cond feats shape:{lh_cond_feats.shape}')
+        else:
+            lh_cond_feats = torch.empty((1, 16, 12, 1280), device=device)
+
+        # 如果右手裁剪图像为空，则跳过对其的处理
+        if rh_cropped_img.shape[1] > 0:
+            rh_cropped_img_tensor = torch.tensor(rh_cropped_img).permute(0, 3, 2, 1).float().to(device)
+            rh_cropped_img_tensor = (rh_cropped_img_tensor / 255.0 - torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)) / torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+            rh_cropped_img_tensor = rh_cropped_img_tensor.half()
+
+            # 提取右手特征
+            rh_cond_feats = self.backbone(rh_cropped_img_tensor)
+            rh_cond_feats = rh_cond_feats.permute(0, 2, 3, 1).float()
+            print(f'rh cond feats shape:{rh_cond_feats.shape}')
+        else:
+            rh_cond_feats = torch.empty((1, 16, 12, 1280), device=device)
+
+
+
         rh_rat_feats = []
         lh_rat_feats = []
-        # for i in range(batch_size):
-        #     image_file = batch['imgname'][i]
-        #     print(image_file)
+
         for i in range(batch_size):
             # Load the original image from the file using the file name
             # image_file = batch['imgname'][i]
             # image = cv2.imread(image_file, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
             image_tensor = images[i]
             # Convert to NumPy array
-            image_np = image_tensor.cpu().numpy()
-            # image_np = np.transpose(image_np, (1, 2, 0))  # Convert from (C, H, W) to (H, W, C)
-            print(image_np.dtype)
-            print(f'image_np shape: {image_np.shape}') # H * W * C
-            # image_np = image.cpu().numpy()
+            # image_np = image_tensor.cpu().numpy()
 
-            # if isinstance(image, torch.Tensor):
-            # # Move the tensor to CPU if it's on the GPU and convert to NumPy
-            #     image = image.cpu().numpy()
-            #     # Ensure the image is in the correct format (e.g., HWC format and dtype=uint8)
-            #     image = image.transpose(1, 2, 0)  # Convert from CHW (PyTorch format) to HWC (OpenCV format)
-            #     image = image.astype(np.uint8)  # Ensure the dtype is uint8
+            # 获取第 i 个样本的 lh_bbox 和 rh_bbox
+            lh_box_np = np.array([
+                lh_box[0][i].cpu().item(),  # 提取 x_min
+                lh_box[1][i].cpu().item(),  # 提取 y_min
+                lh_box[2][i].cpu().item(),  # 提取 x_max
+                lh_box[3][i].cpu().item()   # 提取 y_max
+            ])
+
+            rh_box_np = np.array([
+                rh_box[0][i].cpu().item(),  # 提取 x_min
+                rh_box[1][i].cpu().item(),  # 提取 y_min
+                rh_box[2][i].cpu().item(),  # 提取 x_max
+                rh_box[3][i].cpu().item()   # 提取 y_max
+            ])
+
+            print(f'lh box type:{lh_box_np.dtype}')
+            print(f'lh box shape:{lh_box_np.shape}')
+            print(f'lh box:{lh_box_np}')
 
 
-            cv2.imwrite("/home/sjtu/eccv_workspace/hamer/hamer/models/components/test_crop/output_image.jpg", image_np)
-            if image_np is None:
-                # raise IOError(f"Failed to read {image_file}")
-                print("error reading image")
-            # convert tensor to numpy for detection
-            # image_numpy = image.cpu().numpy()
-            # image_numpy = image_numpy[:, :, ::-1]
-
-            lh_cropped_img_tmp, rh_cropped_img_tmp = crop_image(image_np)
-
-            output_dir = "/home/sjtu/eccv_workspace/hamer/hamer/models/components/test_crop"  # Specify your output directory here
-
-            # # Save the left-hand image
-            # lh_image_path = os.path.join(output_dir, "left_hand.png")
-            # cv2.imwrite(lh_image_path, lh_cropped_img_tmp)
-            # print(f"Left hand image saved to {lh_image_path}")
-            # print(f"Left hand image shape{lh_cropped_img_tmp.shape}")
-            # # Save the right-hand image
-            # rh_image_path = os.path.join(output_dir, "right_hand.png")
-            # cv2.imwrite(rh_image_path, rh_cropped_img_tmp)
-            # print(f"Right hand image saved to {rh_image_path}")
-            # print(f"Right hand image shape{rh_cropped_img_tmp.shape}")
-
-            # # lh_cropped_img, rh_cropped_img = np.stack(lh_cropped_img, lh_cropped_img_tmp), np.stack(rh_cropped_img, rh_cropped_img_tmp)
-            # lh_cropped_img.append(lh_cropped_img_tmp)
-            # rh_cropped_img.append(rh_cropped_img_tmp)
-            # Check if the left-hand image is not empty
-            target_size = (256, 192)
-            blank_image = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)  # Create a blank image
-            if lh_cropped_img_tmp is not None and lh_cropped_img_tmp.size > 0:
-                # Save the left-hand image
-                lh_image_path = os.path.join(output_dir, "left_hand.jpg")
-                cv2.imwrite(lh_image_path, lh_cropped_img_tmp)
-                print(f"Left hand image saved to {lh_image_path}")
-                print(f"Left hand image shape: {lh_cropped_img_tmp.shape}")
-                lh_cropped_img.append(lh_cropped_img_tmp)
-            else:
-                print("Left hand image is empty or not detected.Adding a blank image.")
-                lh_cropped_img.append(blank_image)
-
-            # Check if the right-hand image is not empty
-            if rh_cropped_img_tmp is not None and rh_cropped_img_tmp.size > 0:
-                # Save the right-hand image
-                rh_image_path = os.path.join(output_dir, "right_hand.jpg")
-                cv2.imwrite(rh_image_path, rh_cropped_img_tmp)
-                print(f"Right hand image saved to {rh_image_path}")
-                print(f"Right hand image shape: {rh_cropped_img_tmp.shape}")
-                rh_cropped_img.append(rh_cropped_img_tmp)
-            else:
-                print("Right hand image is empty or not detected.Adding a blank image.")
-                rh_cropped_img.append(blank_image)
-
-            # Optionally handle the case where both are empty
-            if (lh_cropped_img_tmp is None or lh_cropped_img_tmp.size == 0) and \
-            (rh_cropped_img_tmp is None or rh_cropped_img_tmp.size == 0):
-                print("Both left-hand and right-hand images are empty or not detected.")
-                lh_cropped_img.append(blank_image)
-                rh_cropped_img.append(blank_image)
-            # rat_x = np.squeeze(image_np, axis=0)
-            rat_x = image_np.copy()
-            print(f"rat_x shape{rat_x.shape}")
-            rh_rat_feats_tmp, lh_rat_feats_tmp = self.rat(rat_x[:, :, :])
+            print(f'rh box type:{rh_box_np.dtype}')
+            print(f'rh box shape:{rh_box_np.shape}')
+            print(f'rh box:{rh_box_np}')
+            # rh_rat_feats_tmp, lh_rat_feats_tmp = self.rat(rat_x[:, :, :])
+            rh_rat_feats_tmp, lh_rat_feats_tmp = self.rat(lh_box_np,rh_box_np)
             # rh_rat_feats, lh_rat_feats = torch.stack(rh_rat_feats_tmp, rh_rat_feats), torch.stack(lh_rat_feats, lh_rat_feats_tmp)
             # Append the features to the lists
-            rh_rat_feats.append(rh_rat_feats_tmp)
-            lh_rat_feats.append(lh_rat_feats_tmp)
+            rh_rat_feats.append(rh_rat_feats_tmp.to(device))
+            lh_rat_feats.append(lh_rat_feats_tmp.to(device))
 
-        # # stack the images
-        # lh_cropped_img = np.stack(lh_cropped_img)
-        # rh_cropped_img = np.stack(rh_cropped_img)
-        target_size = (256, 192)
-        if lh_cropped_img:
-            lh_cropped_img = np.stack(lh_cropped_img)
-        else:
-            # Handle the case where no left-hand images are found
-            lh_cropped_img = np.empty((0, *target_size, 3), dtype=np.uint8)
-
-        if rh_cropped_img:
-            rh_cropped_img = np.stack(rh_cropped_img)
-        else:
-            # Handle the case where no right-hand images are found
-            rh_cropped_img = np.empty((0, *target_size, 3), dtype=np.uint8)
-        # # Once all the features are collected, stack them into tensors
-        # rh_rat_feats = torch.stack(rh_rat_feats)
-        # lh_rat_feats = torch.stack(lh_rat_feats)
         expected_feature_shape = (batch_size, 192, 1280)
         if rh_rat_feats:
             rh_rat_feats = torch.stack(rh_rat_feats)
@@ -278,54 +237,7 @@ class HAMER(pl.LightningModule):
             lh_rat_feats = torch.empty((0, *expected_feature_shape), dtype=torch.float32)
         print(f'rh rat feats shape:{rh_rat_feats.shape}')
         print(f'lh rat feats shape:{lh_rat_feats.shape}')
-        # use circulation method to gain the batch RAT
-        # convert np.array to tensor(same as img_patch) and then pass through vit backbone
-        # Convert to PyTorch tensors
-        print(f'lh_cropped_img shape{lh_cropped_img.shape}')
-        print(f'rh_cropped_img shape{rh_cropped_img.shape}')
-        lh_cropped_img_tensor = torch.tensor(lh_cropped_img).permute(0, 3, 2, 1).float()  # Change from (batch, height, width, channels) to (batch, channels, height, width)
-        rh_cropped_img_tensor = torch.tensor(rh_cropped_img).permute(0, 3, 2, 1).float()  # Same conversion
-        print(f'lh_cropped_img_tensor shape{lh_cropped_img_tensor.shape}')
-        print(f'rh_cropped_img_tensor shape{rh_cropped_img_tensor.shape}')
-        # breakpoint()
 
-        # Normalize the tensors if required
-        # Assuming mean and std normalization values are already defined
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-
-        lh_cropped_img_tensor = (lh_cropped_img_tensor / 255.0 - mean) / std
-        rh_cropped_img_tensor = (rh_cropped_img_tensor / 255.0 - mean) / std
-        # Convert to float16 if using mixed precision
-        # lh_cropped_img_tensor = lh_cropped_img_tensor.to(torch.float16)
-        # rh_cropped_img_tensor = rh_cropped_img_tensor.to(torch.float16)
-        lh_cropped_img_tensor = lh_cropped_img_tensor.half()
-        rh_cropped_img_tensor = rh_cropped_img_tensor.half()
-
-        # Determine the device: Use GPU if available, otherwise CPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Move model and tensor to the device
-        self.backbone = self.backbone.to(device)
-        lh_cropped_img_tensor = lh_cropped_img_tensor.to(device)
-        rh_cropped_img_tensor = rh_cropped_img_tensor.to(device)
-        # Pass the tensors to the backbone
-        lh_cond_feats = self.backbone(lh_cropped_img_tensor)
-        lh_cond_feats = torch.tensor(lh_cond_feats).permute(0, 2, 3, 1).float()
-        lh_cond_feats = lh_cond_feats.to(device)
-        print(f'lh_cond_feats shape:{lh_cond_feats.shape}')
-        rh_cond_feats = self.backbone(rh_cropped_img_tensor)
-        rh_cond_feats = torch.tensor(rh_cond_feats).permute(0, 2, 3, 1).float()
-        rh_cond_feats = rh_cond_feats.to(device)
-        print(f'rh_cond_feats shape:{rh_cond_feats.shape}')
-        # rh_cond_feats = self.backbone(rh_cropped_img[:, :, :, :])
-        # lh_cond_feats = self.backbone(lh_cropped_img[:, :, :, :])
-
-        # rh_all_feats = torch.concat(rh_cond_feats, rh_rat_feats, axis = -1)
-        # lh_all_feats = torch.concat(lh_cond_feats, lh_rat_feats, axis = -1)
-        # rh_flatten_feats = torch.flatten(rh_all_feats, start_dim=0, end_dim=1)
-        # lh_flatten_feats = torch.flatten(lh_all_feats, start_dim=0, end_dim=1)
-        # ult_feats = torch.concat(rh_flatten_feats, lh_flatten_feats, axis = 0)
         # Concatenate the tensors along the last dimension
         rh_rat_feats = rh_rat_feats.to(device)
         rh_all_feats = torch.concat((rh_cond_feats, rh_rat_feats), dim=-1)
@@ -347,22 +259,24 @@ class HAMER(pl.LightningModule):
         B, H, W, C = rh_all_feats.shape
         rh_all_feats = rh_all_feats.view(B, H * W, C)
         lh_all_feats = lh_all_feats.view(B, H * W, C)
-        ult_feats = torch.concat((rh_all_feats, lh_all_feats), dim=1)
+        ult_feats = torch.concat((rh_all_feats, lh_all_feats), dim=2)
         print(f'shape of ult feats:{ult_feats.shape}')
-        breakpoint()
+        print(f'ult feats:{ult_feats}')
         """
         The Ultimate features keeps the dimension of 768*2560
         """
 
-        sir_token = self.sir(ult_feats)
-        print(f'sir token shape:{sir_token.shape}')
-        pred_mano_params, pred_cam, _ = self.mano_head(sir_token)
-
+        # sir_token = self.sir(ult_feats)
+        # print(f'sir token shape:{sir_token.shape}')
+        pred_mano_params, pred_cam, _ = self.mano_head(lh_cond_feats)
+        # pred_mano_params, pred_cam, _ = self.mano_head(ult_feats)
 
         # Store useful regression outputs to the output dict
         output = {}
         output['pred_cam'] = pred_cam
+        print(f'pred cam:{pred_cam}')
         output['pred_mano_params'] = {k: v.clone() for k,v in pred_mano_params.items()}
+        print(f'pred mano params:{pred_mano_params}')
 
         # Compute camera translation
         device = pred_mano_params['hand_pose'].device
@@ -382,6 +296,7 @@ class HAMER(pl.LightningModule):
         pred_keypoints_3d = mano_output.joints
         pred_vertices = mano_output.vertices
         output['pred_keypoints_3d'] = pred_keypoints_3d.reshape(batch_size, -1, 3)
+        print(f'pred 3d keyp:{pred_keypoints_3d}')
         output['pred_vertices'] = pred_vertices.reshape(batch_size, -1, 3)
         pred_cam_t = pred_cam_t.reshape(-1, 3)
         focal_length = focal_length.reshape(-1, 2)
@@ -390,6 +305,7 @@ class HAMER(pl.LightningModule):
                                                    focal_length=focal_length / self.cfg.MODEL.IMAGE_SIZE)
 
         output['pred_keypoints_2d'] = pred_keypoints_2d.reshape(batch_size, -1, 2)
+        print(f'pred 2d keyp:{pred_keypoints_2d}')
         # TODO compute InterHand Params pred_inter_hand()
         return output
 
@@ -445,6 +361,7 @@ class HAMER(pl.LightningModule):
             losses['loss_' + k] = v.detach()
 
         output['losses'] = losses
+        print(f'losses:{losses}')
 
         return loss
 
@@ -563,6 +480,7 @@ class HAMER(pl.LightningModule):
         if self.cfg.get('UPDATE_GT_SPIN', False):
             self.update_batch_gt_spin(batch, output)
         loss = self.compute_loss(batch, output, train=True)
+        print(f'loss:{loss}')
         if self.cfg.LOSS_WEIGHTS.ADVERSARIAL > 0:
             disc_out = self.discriminator(pred_mano_params['hand_pose'].reshape(batch_size, -1), pred_mano_params['betas'].reshape(batch_size, -1))
             loss_adv = ((disc_out - 1.0) ** 2).sum() / batch_size
