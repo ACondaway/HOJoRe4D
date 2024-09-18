@@ -1,453 +1,557 @@
+import copy
+import os
+import numpy as np
 import torch
-import pytorch_lightning as pl
-from typing import Any, Dict, Mapping, Tuple
-
+from typing import Any, Dict, List
 from yacs.config import CfgNode
+import braceexpand
+import cv2
 
-from ..utils import SkeletonRenderer, MeshRenderer
-from ..utils.geometry import aa_to_rotmat, perspective_projection
-from ..utils.pylogger import get_pylogger
-from .backbones import create_backbone
-from .heads import build_mano_head
-from .discriminator import Discriminator
-from .losses import Keypoint3DLoss, Keypoint2DLoss, ParameterLoss, InterhandJLoss, InterhandVLoss, MaxMSELoss
-from . import MANO
+from .dataset import Dataset
+from .utils import get_example, expand_to_aspect_ratio
 
-from .components import rat
-from .components.sir import SIR, initialize_sir_parameters, MLP
-from .components.cropped_image import *
+def expand(s):
+    return os.path.expanduser(os.path.expandvars(s))
+def expand_urls(urls: str|List[str]):
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [u for url in urls for u in braceexpand.braceexpand(expand(url))]
+    return urls
 
-log = get_pylogger(__name__)
+FLIP_KEYPOINT_PERMUTATION = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 
-class HAMER(pl.LightningModule):
+DEFAULT_MEAN = 255. * np.array([0.485, 0.456, 0.406])
+DEFAULT_STD = 255. * np.array([0.229, 0.224, 0.225])
+DEFAULT_IMG_SIZE = 256
 
-    def __init__(self, cfg: CfgNode, init_renderer: bool = True):
+class ImageDataset(Dataset):
+
+    def __init__(self,
+                 cfg: CfgNode,
+                 dataset_file: str,
+                 img_dir: str,
+                 train: bool = True,
+                 rescale_factor = 2,
+                 prune: Dict[str, Any] = {},
+                 **kwargs):
         """
-        Setup HAMER model
+        Dataset class used for loading images and corresponding annotations.
         Args:
-            cfg (CfgNode): Config file as a yacs CfgNode
+            cfg (CfgNode): Model config file.
+            dataset_file (str): Path to npz file containing dataset info.
+            img_dir (str): Path to image folder.
+            train (bool): Whether it is for training or not (enables data augmentation).
         """
-        super().__init__()
-
-        # Save hyperparameters
-        self.save_hyperparameters(logger=False, ignore=['init_renderer'])
-
+        super(ImageDataset, self).__init__()
+        self.train = train
         self.cfg = cfg
 
-        # 在这里定义rat的参数设置
-        self.rat = rat(cfg)
-        # 初始化sir
-        #self.sir = sir(cfg)
-        self.sir = SIR(
-            input_dim=cfg.MODEL.SIR.INPUT_DIM,
-            hidden_dim=cfg.MODEL.SIR.HIDDEN_SIZE,
-            num_heads=cfg.MODEL.SIR.NUM_HEADS,
-            num_layers=cfg.MODEL.SIR.NUM_LAYERS,
-            output_dim=cfg.MODEL.SIR.OUTPUT_DIM,
-        )
-        self.mlp = MLP()
-        # Create backbone feature extractor
-        self.backbone = create_backbone(cfg)
-        if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
-            log.info(f'Loading backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
-            self.backbone.load_state_dict(torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict'])
-            # Load the pre-trained weights with strict=False
-            # self.backbone.load_state_dict(torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict'], strict=False)
-            # self.sir.apply(initialize_sir_parameters)
+        self.img_size = cfg.MODEL.IMAGE_SIZE
+        self.mean = 255. * np.array(self.cfg.MODEL.IMAGE_MEAN)
+        self.std = 255. * np.array(self.cfg.MODEL.IMAGE_STD)
+        self.rescale_factor = rescale_factor
 
+        self.img_dir = img_dir
+        self.data = np.load(dataset_file, allow_pickle=True)
 
-        # Create MANO head
-        self.mano_head = build_mano_head(cfg)
+        self.imgname = self.data['imgname']
+        self.personid = np.zeros(len(self.imgname), dtype=np.int32)
+        self.extra_info = self.data.get('extra_info', [{} for _ in range(len(self.imgname))])
 
-        # Create discriminator GAN-based transformer
-        if self.cfg.LOSS_WEIGHTS.ADVERSARIAL > 0:
-            self.discriminator = Discriminator()
+        self.flip_keypoint_permutation = copy.copy(FLIP_KEYPOINT_PERMUTATION)
 
-        # Define loss functions
-        self.keypoint_3d_loss = Keypoint3DLoss(loss_type='l1')
-        self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1')
-        self.mano_parameter_loss = ParameterLoss()
-        # self.interhand_j_loss = InterhandJLoss(loss_type='l2')
+        num_pose = 3 * (self.cfg.MANO.NUM_HAND_JOINTS + 1)
 
-        # Instantiate MANO model
-        mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
-        self.mano = MANO(**mano_cfg)
+        # Bounding boxes are assumed to be in the center and scale format
+        self.center = self.data['center']
+        self.scale = self.data['scale'].reshape(len(self.center), -1) / 200.0
+        if self.scale.shape[1] == 1:
+            self.scale = np.tile(self.scale, (1, 2))
+        assert self.scale.shape == (len(self.center), 2)
 
-        # Buffer that shows whetheer we need to initialize ActNorm layers
-        self.register_buffer('initialized', torch.tensor(False))
-        # Setup renderer for visualization
-        if init_renderer:
-            self.renderer = SkeletonRenderer(self.cfg)
-            self.mesh_renderer = MeshRenderer(self.cfg, faces=self.mano.faces)
+        try:
+            self.right = self.data['right']
+        except KeyError:
+            self.right = np.ones(len(self.imgname), dtype=np.float32)
+
+        # Get gt MANO parameters, if available
+        try:
+            self.hand_pose = self.data['hand_pose'].astype(np.float32)
+            self.has_hand_pose = self.data['has_hand_pose'].astype(np.float32)
+        except KeyError:
+            self.hand_pose = np.zeros((len(self.imgname), num_pose), dtype=np.float32)
+            self.has_hand_pose = np.zeros(len(self.imgname), dtype=np.float32)
+        try:
+            self.betas = self.data['betas'].astype(np.float32)
+            self.has_betas = self.data['has_betas'].astype(np.float32)
+        except KeyError:
+            self.betas = np.zeros((len(self.imgname), 10), dtype=np.float32)
+            self.has_betas = np.zeros(len(self.imgname), dtype=np.float32)
+
+        # Try to get 2d keypoints, if available
+        try:
+            hand_keypoints_2d = self.data['hand_keypoints_2d']
+        except KeyError:
+            hand_keypoints_2d = np.zeros((len(self.center), 21, 3))
+
+        self.keypoints_2d = hand_keypoints_2d
+
+        # Try to get 3d keypoints, if available
+        try:
+            hand_keypoints_3d = self.data['hand_keypoints_3d'].astype(np.float32)
+        except KeyError:
+            hand_keypoints_3d = np.zeros((len(self.center), 21, 4), dtype=np.float32)
+
+        self.keypoints_3d = hand_keypoints_3d
+
+    def __len__(self) -> int:
+        return len(self.scale)
+
+    def __getitem__(self, idx: int) -> Dict:
+        """
+        Returns an example from the dataset.
+        """
+        try:
+            image_file_rel = self.imgname[idx].decode('utf-8')
+        except AttributeError:
+            image_file_rel = self.imgname[idx]
+        image_file = os.path.join(self.img_dir, image_file_rel)
+        keypoints_2d = self.keypoints_2d[idx].copy()
+        keypoints_3d = self.keypoints_3d[idx].copy()
+
+        center = self.center[idx].copy()
+        center_x = center[0]
+        center_y = center[1]
+        scale = self.scale[idx]
+        right = self.right[idx].copy()
+        if self.rescale_factor == -1:
+            BBOX_SHAPE = self.cfg.MODEL.get('BBOX_SHAPE', None)
+            bbox_size = expand_to_aspect_ratio(scale*200, target_aspect_ratio=BBOX_SHAPE).max()
+            bbox_expand_factor = bbox_size / ((scale*200).max())
         else:
-            self.renderer = None
-            self.mesh_renderer = None
+            bbox_expand_factor = self.rescale_factor
+            bbox_size = bbox_expand_factor*scale.max()*200
+        hand_pose = self.hand_pose[idx].copy().astype(np.float32)
+        betas = self.betas[idx].copy().astype(np.float32)
 
-        # Disable automatic optimization since we use adversarial training
-        self.automatic_optimization = False
+        has_hand_pose = self.has_hand_pose[idx].copy()
+        has_betas = self.has_betas[idx].copy()
 
-    def get_parameters(self):
-        # TODO The meaning of all_params is not clear, should be modified after, The Params should be all put into the optimizer
-        all_params = list(self.mano_head.parameters())
-        all_params += list(self.backbone.parameters())
-        # all_params += list(self.rat.parameters())
-        return all_params
+        mano_params = {'global_orient': hand_pose[:3],
+                       'hand_pose': hand_pose[3:],
+                       'betas': betas
+                      }
 
-    def configure_optimizers(self) -> Tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
-        """
-        Setup model and distriminator Optimizers
-        Returns:
-            Tuple[torch.optim.Optimizer, torch.optim.Optimizer]: Model and discriminator optimizers
-        """
-        param_groups = [{'params': filter(lambda p: p.requires_grad, self.get_parameters()), 'lr': self.cfg.TRAIN.LR}]
+        has_mano_params = {'global_orient': has_hand_pose,
+                           'hand_pose': has_hand_pose,
+                           'betas': has_betas
+                           }
 
-        optimizer = torch.optim.AdamW(params=param_groups,
-                                        # lr=self.cfg.TRAIN.LR,
-                                        weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
-        optimizer_disc = torch.optim.AdamW(params=self.discriminator.parameters(),
-                                            lr=self.cfg.TRAIN.LR,
-                                            weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
+        mano_params_is_axis_angle = {'global_orient': True,
+                                     'hand_pose': True,
+                                     'betas': False
+                                    }
 
-        return optimizer, optimizer_disc
-
-    def forward_step(self, batch: Dict, train: bool = False) -> Dict:
-        """
-        Run a forward step of the network
-        Args:
-            batch (Dict): Dictionary containing batch data
-            train (bool): Flag indicating whether it is training or validation mode
-        Returns:
-            Dict: Dictionary containing the regression output
-        """
-
-        # Use RGB image as input
-        images = batch['img']
-        conditioning_feats = self.backbone(images[:,:,:,32:-32])
-        lh_box = batch['bbox']
-        rh_box = batch['other_hand_bbox']
-        batch_size = images.shape[0]
-        # Determine the device: Use GPU if available, otherwise CPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        rh_rat_feats = []
-        lh_rat_feats = []
-
-        for i in range(batch_size):
-
-            # 获取第 i 个样本的 lh_bbox 和 rh_bbox
-            lh_box_np = np.array([
-                lh_box[0][i].cpu().item(),  # 提取 x_min
-                lh_box[1][i].cpu().item(),  # 提取 y_min
-                lh_box[2][i].cpu().item(),  # 提取 x_max
-                lh_box[3][i].cpu().item()   # 提取 y_max
-            ])
-            # print({f'bbox:{lh_box_np}'})
-            rh_box_np = np.array([
-                rh_box[0][i].cpu().item(),  # 提取 x_min
-                rh_box[1][i].cpu().item(),  # 提取 y_min
-                rh_box[2][i].cpu().item(),  # 提取 x_max
-                rh_box[3][i].cpu().item()   # 提取 y_max
-            ])
-            # print({f'other hand bbox:{rh_box_np}'})
-            rh_rat_feats_tmp, lh_rat_feats_tmp = self.rat(lh_box_np,rh_box_np)
-            # rh_rat_feats, lh_rat_feats = torch.stack(rh_rat_feats_tmp, rh_rat_feats), torch.stack(lh_rat_feats, lh_rat_feats_tmp)
-            # Append the features to the lists
-            rh_rat_feats.append(rh_rat_feats_tmp.to(device))
-            lh_rat_feats.append(lh_rat_feats_tmp.to(device))
-
-        expected_feature_shape = (batch_size, 192, 1280)
-        if rh_rat_feats:
-            rh_rat_feats = torch.stack(rh_rat_feats)
-        else:
-            # Handle the case where no right-hand features are found
-            rh_rat_feats = torch.empty((0, *expected_feature_shape), dtype=torch.float32)
-
-        if lh_rat_feats:
-            lh_rat_feats = torch.stack(lh_rat_feats)
-        else:
-            # Handle the case where no left-hand features are found
-            lh_rat_feats = torch.empty((0, *expected_feature_shape), dtype=torch.float32)
-
-        # Concatenate the tensors along the last dimension
-        rh_rat_feats = rh_rat_feats.to(device)
-        rh_rat_feats = torch.nan_to_num(rh_rat_feats, nan=0.0)
-        lh_rat_feats = lh_rat_feats.to(device)
-        lh_rat_feats = torch.nan_to_num(lh_rat_feats, nan=0.0)
+        augm_config = self.cfg.DATASETS.CONFIG
+        # Crop image and (possibly) perform data augmentation
+        img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size, original = get_example(image_file,
+                                                                                                    center_x, center_y,
+                                                                                                    bbox_size, bbox_size,
+                                                                                                    keypoints_2d, keypoints_3d,
+                                                                                                    mano_params, has_mano_params,
+                                                                                                    self.flip_keypoint_permutation,
+                                                                                                    self.img_size, self.img_size,
+                                                                                                    self.mean, self.std, self.train, right, augm_config)
+        item = {}
+        # These are the keypoints in the original image coordinates (before cropping)
+        orig_keypoints_2d = self.keypoints_2d[idx].copy()
         
-        B, C, H, W = conditioning_feats.shape
-        conditioning_feats = conditioning_feats.view(B, H * W, C)
-        B, H, W, C = rh_rat_feats.shape
-        rh_rat_feats = rh_rat_feats.view(B, H * W, C)
-        lh_rat_feats = lh_rat_feats.view(B, H * W, C)
-        ult_rat_feats = torch.concat((rh_rat_feats, lh_rat_feats), dim=2)
-        ult_feats = torch.concat((conditioning_feats, ult_rat_feats), dim=2)
-        ult_feats = torch.nan_to_num(ult_feats, nan=0.0)
-        # print(f'shape of correct ult feats:{ult_feats.shape}')
-        # print(f'correct ult feats:{ult_feats}')
+        # item['img'] = img_patch
+        # resized_image = cv2.resize(item['jpg'], (224, 224))  # Resize to 224x224 pixels
+        # item['jpg'] = resized_image
+        # item['img'] = original_image
+        # return read og_img
+        # item['img_og'] = original_image
+        # cancel because takes up too much memory
+        item['keypoints_2d'] = keypoints_2d.astype(np.float32)
+        item['keypoints_3d'] = keypoints_3d.astype(np.float32)
+        item['orig_keypoints_2d'] = orig_keypoints_2d
+        item['box_center'] = self.center[idx].copy()
+        item['box_size'] = bbox_size
+        item['bbox_expand_factor'] = bbox_expand_factor
+        item['img_size'] = 1.0 * img_size[::-1].copy()
+        item['mano_params'] = mano_params
+        item['has_mano_params'] = has_mano_params
+        item['mano_params_is_axis_angle'] = mano_params_is_axis_angle
+        item['imgname'] = image_file
+        item['imgname_rel'] = image_file_rel
+        item['personid'] = int(self.personid[idx])
+        item['extra_info'] = copy.deepcopy(self.extra_info[idx])
+        item['idx'] = idx
+        item['_scale'] = scale
+        item['right'] = self.right[idx].copy()
+        return item
+
+    @staticmethod
+    def load_tars_as_webdataset(cfg: CfgNode, urls: str|List[str], train: bool,
+            resampled=False,
+            epoch_size=None,
+            cache_dir=None,
+            **kwargs) -> Dataset:
         """
-        The Ultimate features keeps the dimension of 768*2560
-        """
-
-
-        sir_token = self.sir(ult_feats)
-
-        pred_mano_params, pred_cam, _ = self.mano_head(sir_token)
-        # Store useful regression outputs to the output dict
-        output = {}
-        output['pred_cam'] = pred_cam
-        # print(f'pred cam:{pred_cam}')
-        output['pred_mano_params'] = {k: v.clone() for k,v in pred_mano_params.items()}
-        # print(f'pred mano params:{pred_mano_params}')
-
-        # Compute camera translation
-        device = pred_mano_params['hand_pose'].device
-        dtype = pred_mano_params['hand_pose'].dtype
-        focal_length = self.cfg.EXTRA.FOCAL_LENGTH * torch.ones(batch_size, 2, device=device, dtype=dtype)
-        pred_cam_t = torch.stack([pred_cam[:, 1],
-                                  pred_cam[:, 2],
-                                  2*focal_length[:, 0]/(self.cfg.MODEL.IMAGE_SIZE * pred_cam[:, 0] +1e-9)],dim=-1)
-        output['pred_cam_t'] = pred_cam_t
-        output['focal_length'] = focal_length
-
-        # Compute model vertices, joints and the projected joints
-        pred_mano_params['global_orient'] = pred_mano_params['global_orient'].reshape(batch_size, -1, 3, 3)
-        pred_mano_params['hand_pose'] = pred_mano_params['hand_pose'].reshape(batch_size, -1, 3, 3)
-        pred_mano_params['betas'] = pred_mano_params['betas'].reshape(batch_size, -1)
-        mano_output = self.mano(**{k: v.float() for k,v in pred_mano_params.items()}, pose2rot=False)
-        pred_keypoints_3d = mano_output.joints
-        pred_vertices = mano_output.vertices
-        output['pred_keypoints_3d'] = pred_keypoints_3d.reshape(batch_size, -1, 3)
-        # print(f'pred 3d keyp:{pred_keypoints_3d}')
-        output['pred_vertices'] = pred_vertices.reshape(batch_size, -1, 3)
-        pred_cam_t = pred_cam_t.reshape(-1, 3)
-        focal_length = focal_length.reshape(-1, 2)
-        pred_keypoints_2d = perspective_projection(pred_keypoints_3d,
-                                                   translation=pred_cam_t,
-                                                   focal_length=focal_length / self.cfg.MODEL.IMAGE_SIZE)
-
-        output['pred_keypoints_2d'] = pred_keypoints_2d.reshape(batch_size, -1, 2)
-        # print(f'pred 2d keyp:{pred_keypoints_2d}')
-        # TODO compute InterHand Params pred_inter_hand()
-        return output
-
-    def compute_loss(self, batch: Dict, output: Dict, train: bool = True) -> torch.Tensor:
-        """
-        Compute losses given the input batch and the regression output
-        Args:
-            batch (Dict): Dictionary containing batch data
-            output (Dict): Dictionary containing the regression output
-            train (bool): Flag indicating whether it is training or validation mode
-        Returns:
-            torch.Tensor : Total loss for current batch
+        Loads the dataset from a webdataset tar file.
         """
 
-        pred_mano_params = output['pred_mano_params']
-        pred_keypoints_2d = output['pred_keypoints_2d']
-        pred_keypoints_3d = output['pred_keypoints_3d']
+        IMG_SIZE = cfg.MODEL.IMAGE_SIZE
+        BBOX_SHAPE = cfg.MODEL.get('BBOX_SHAPE', None)
+        MEAN = 255. * np.array(cfg.MODEL.IMAGE_MEAN)
+        STD = 255. * np.array(cfg.MODEL.IMAGE_STD)
+
+        def split_data(source):
+            for item in source:
+                datas = item['data.pyd']
+                if len(datas) == 2:
+                    # 双手数据，分别处理左右手
+                    if datas[0]['right'] < 0:
+                        left_hand_data = datas[0]
+                        right_hand_data = datas[1]
+                    else:
+                        left_hand_data = datas[1]
+                        right_hand_data = datas[0]
+
+                    # 为左手数据附加右手的 center 和 scale 信息
+                    left_hand_data['other_hand_center'] = right_hand_data['center']
+                    left_hand_data['other_hand_scale'] = right_hand_data['scale']
+                    left_hand_data['other_hand_keypoints'] = right_hand_data['keypoints_3d']
+                    left_hand_data['other_hand_data'] = right_hand_data
+
+                    # 为右手数据附加左手的 center 和 scale 信息
+                    right_hand_data['other_hand_center'] = left_hand_data['center']
+                    right_hand_data['other_hand_scale'] = left_hand_data['scale']
+                    right_hand_data['other_hand_keypoints'] = left_hand_data['keypoints_3d']
+                    right_hand_data['other_hand_data'] = left_hand_data
+
+                    if 'detection.npz' in left_hand_data:
+                        det_idx = left_hand_data['extra_info']['detection_npz_idx']
+                        left_mask = item['detection.npz']['masks'][det_idx]
+                    else:
+                        left_mask = np.ones_like(item['jpg'][:,:,0], dtype=bool)
+
+                    if 'detection.npz' in right_hand_data:
+                        det_idx = right_hand_data['extra_info']['detection_npz_idx']
+                        right_mask = item['detection.npz']['masks'][det_idx]
+                    else:
+                        right_mask = np.ones_like(item['jpg'][:,:,0], dtype=bool)
+                    
+                    # 返回双手数据
+                    # yield {
+                    #     '__key__': item['__key__'],
+                    #     'jpg': item['jpg'],
+                    #     'left_data.pyd': left_hand_data,
+                    #     'left_mask': left_mask,
+                    #     'right_data.pyd': right_hand_data,
+                    #     'right_mask': right_mask
+
+                    #     # 'is_right_hand': False
+                    # }
+                    # 处理左手数据
+                    yield {
+                        '__key__': item['__key__'],
+                        'jpg': item['jpg'],
+                        'data.pyd': left_hand_data,
+                        'mask': left_mask,
+                        'is_right_hand': False
+                    }
+
+                    # 处理右手数据
+                    yield {
+                        '__key__': item['__key__'],
+                        'jpg': item['jpg'],
+                        'data.pyd': right_hand_data,
+                        'mask': right_mask,
+                        'is_right_hand': True
+                    }
+
+                else:
+                    # print(f'len datas:{len(datas)}')
+                    # continue
+                    # 处理单手数据（没有另一只手的数据）
+                    hand_data = datas[0]
+                    if 'detection.npz' in hand_data:
+                        det_idx = hand_data['extra_info']['detection_npz_idx']
+                        mask = item['detection.npz']['masks'][det_idx]
+                    else:
+                        mask = np.ones_like(item['jpg'][:,:,0], dtype=bool)
+                    yield {
+                        '__key__': item['__key__'],
+                        'jpg': item['jpg'],
+                        'data.pyd': hand_data,
+                        'mask': mask,
+                        'is_right_hand': hand_data['right'] > 0.5,
+                        'other_hand_center': None,
+                        'other_hand_scale': None
+                    }
+                # for data in datas:
+                #     if 'detection.npz' in item:
+                #         det_idx = data['extra_info']['detection_npz_idx']
+                #         mask = item['detection.npz']['masks'][det_idx]
+                #     else:
+                #         mask = np.ones_like(item['jpg'][:,:,0], dtype=bool)
+                #     yield {
+                #         '__key__': item['__key__'],
+                #         'jpg': item['jpg'],
+                #         'data.pyd': data,
+                #         'mask': mask,
+                #     }
+
+        def suppress_bad_kps(item, thresh=0.0):
+            if thresh > 0:
+                kp2d = item['data.pyd']['keypoints_2d']
+                kp2d_conf = np.where(kp2d[:, 2] < thresh, 0.0, kp2d[:, 2])
+                item['data.pyd']['keypoints_2d'] = np.concatenate([kp2d[:,:2], kp2d_conf[:,None]], axis=1)
+            return item
+
+        def filter_numkp(item, numkp=4, thresh=0.0):
+            kp_conf = item['data.pyd']['keypoints_2d'][:, 2]
+            return (kp_conf > thresh).sum() > numkp
+
+        def filter_reproj_error(item, thresh=10**4.5):
+            losses = item['data.pyd'].get('extra_info', {}).get('fitting_loss', np.array({})).item()
+            reproj_loss = losses.get('reprojection_loss', None)
+            return reproj_loss is None or reproj_loss < thresh
+
+        def filter_bbox_size(item, thresh=1):
+            bbox_size_min = item['data.pyd']['scale'].min().item() * 200.
+            return bbox_size_min > thresh
+
+        def filter_no_poses(item):
+            return (item['data.pyd']['has_hand_pose'] > 0)
+
+        def supress_bad_betas(item, thresh=3):
+            has_betas = item['data.pyd']['has_betas']
+            if thresh > 0 and has_betas:
+                betas_abs = np.abs(item['data.pyd']['betas'])
+                if (betas_abs > thresh).any():
+                    item['data.pyd']['has_betas'] = False
+            return item
+
+        def supress_bad_poses(item):
+            has_hand_pose = item['data.pyd']['has_hand_pose']
+            if has_hand_pose:
+                hand_pose = item['data.pyd']['hand_pose']
+                pose_is_probable = poses_check_probable(torch.from_numpy(hand_pose)[None, 3:], amass_poses_hist100_smooth).item()
+                if not pose_is_probable:
+                    item['data.pyd']['has_hand_pose'] = False
+            return item
+
+        def poses_betas_simultaneous(item):
+            # We either have both hand_pose and betas, or neither
+            has_betas = item['data.pyd']['has_betas']
+            has_hand_pose = item['data.pyd']['has_hand_pose']
+            item['data.pyd']['has_betas'] = item['data.pyd']['has_hand_pose'] = np.array(float((has_hand_pose>0) and (has_betas>0)))
+            return item
+
+        def set_betas_for_reg(item):
+            # Always have betas set to true
+            has_betas = item['data.pyd']['has_betas']
+            betas = item['data.pyd']['betas']
+
+            if not (has_betas>0):
+                item['data.pyd']['has_betas'] = np.array(float((True)))
+                item['data.pyd']['betas'] = betas * 0
+            return item
+        
 
 
+        # Load the dataset
+        if epoch_size is not None:
+            resampled = True
+        #corrupt_filter = lambda sample: (sample['__key__'] not in CORRUPT_KEYS)
+        import webdataset as wds
+        dataset = wds.WebDataset(expand_urls(urls),
+                                nodesplitter=wds.split_by_node,
+                                shardshuffle=True,
+                                # shardshuffle=False,
+                                resampled=resampled,
+                                cache_dir=cache_dir,
+                              ) #.select(corrupt_filter)
+        # stop shuffle for temporal decoder
+        # if train:
+        #     dataset = dataset.shuffle(100)
+        dataset = dataset.decode('rgb8').rename(jpg='jpg;jpeg;png')
 
-        batch_size = pred_mano_params['hand_pose'].shape[0]
-        device = pred_mano_params['hand_pose'].device
-        dtype = pred_mano_params['hand_pose'].dtype
+        # Process the dataset
+        dataset = dataset.compose(split_data)
 
-        # Get annotations
-        gt_keypoints_2d = batch['keypoints_2d']
-        gt_keypoints_3d = batch['keypoints_3d']
-        gt_mano_params = batch['mano_params']
-        has_mano_params = batch['has_mano_params']
-        is_axis_angle = batch['mano_params_is_axis_angle']
+        # Filter/clean the dataset
+        SUPPRESS_KP_CONF_THRESH = cfg.DATASETS.get('SUPPRESS_KP_CONF_THRESH', 0.0)
+        SUPPRESS_BETAS_THRESH = cfg.DATASETS.get('SUPPRESS_BETAS_THRESH', 0.0)
+        SUPPRESS_BAD_POSES = cfg.DATASETS.get('SUPPRESS_BAD_POSES', False)
+        POSES_BETAS_SIMULTANEOUS = cfg.DATASETS.get('POSES_BETAS_SIMULTANEOUS', False)
+        BETAS_REG = cfg.DATASETS.get('BETAS_REG', False)
+        FILTER_NO_POSES = cfg.DATASETS.get('FILTER_NO_POSES', False)
+        FILTER_NUM_KP = cfg.DATASETS.get('FILTER_NUM_KP', 4)
+        FILTER_NUM_KP_THRESH = cfg.DATASETS.get('FILTER_NUM_KP_THRESH', 0.0)
+        FILTER_REPROJ_THRESH = cfg.DATASETS.get('FILTER_REPROJ_THRESH', 0.0)
+        FILTER_MIN_BBOX_SIZE = cfg.DATASETS.get('FILTER_MIN_BBOX_SIZE', 0.0)
+        if SUPPRESS_KP_CONF_THRESH > 0:
+            dataset = dataset.map(lambda x: suppress_bad_kps(x, thresh=SUPPRESS_KP_CONF_THRESH))
+        if SUPPRESS_BETAS_THRESH > 0:
+            dataset = dataset.map(lambda x: supress_bad_betas(x, thresh=SUPPRESS_BETAS_THRESH))
+        if SUPPRESS_BAD_POSES:
+            dataset = dataset.map(lambda x: supress_bad_poses(x))
+        if POSES_BETAS_SIMULTANEOUS:
+            dataset = dataset.map(lambda x: poses_betas_simultaneous(x))
+        if FILTER_NO_POSES:
+            dataset = dataset.select(lambda x: filter_no_poses(x))
+        if FILTER_NUM_KP > 0:
+            dataset = dataset.select(lambda x: filter_numkp(x, numkp=FILTER_NUM_KP, thresh=FILTER_NUM_KP_THRESH))
+        if FILTER_REPROJ_THRESH > 0:
+            dataset = dataset.select(lambda x: filter_reproj_error(x, thresh=FILTER_REPROJ_THRESH))
+        if FILTER_MIN_BBOX_SIZE > 0:
+            dataset = dataset.select(lambda x: filter_bbox_size(x, thresh=FILTER_MIN_BBOX_SIZE))
+        if BETAS_REG:
+            dataset = dataset.map(lambda x: set_betas_for_reg(x))       # NOTE: Must be at the end
+
+        use_skimage_antialias = cfg.DATASETS.get('USE_SKIMAGE_ANTIALIAS', False)
+        border_mode = {
+            'constant': cv2.BORDER_CONSTANT,
+            'replicate': cv2.BORDER_REPLICATE,
+        }[cfg.DATASETS.get('BORDER_MODE', 'constant')]
+
+        # Process the dataset further
+        dataset = dataset.map(lambda x: ImageDataset.process_webdataset_tar_item(x, train,
+                                                        augm_config=cfg.DATASETS.CONFIG,
+                                                        MEAN=MEAN, STD=STD, IMG_SIZE=IMG_SIZE,
+                                                        BBOX_SHAPE=BBOX_SHAPE,
+                                                        use_skimage_antialias=use_skimage_antialias,
+                                                        border_mode=border_mode,
+                                                        ))
+                                                        # )).select(lambda x: x is not None)  # modified by lyt,过滤掉None项
+        if epoch_size is not None:
+            dataset = dataset.with_epoch(epoch_size)
+
+        return dataset
+
+    @staticmethod
+    def process_webdataset_tar_item(item, train, 
+                                    augm_config=None, 
+                                    MEAN=DEFAULT_MEAN, 
+                                    STD=DEFAULT_STD, 
+                                    IMG_SIZE=DEFAULT_IMG_SIZE,
+                                    BBOX_SHAPE=None,
+                                    use_skimage_antialias=False,
+                                    border_mode=cv2.BORDER_CONSTANT,
+                                    ):
+
+        # Read data from item
+        key = item['__key__']
+        image = item['jpg']
+        data = item['data.pyd']
+        mask = item['mask']
+        
+
+        keypoints_2d = data['keypoints_2d']
+        keypoints_3d = data['keypoints_3d']
+
+        center = data['center']
+        scale = data['scale']
+        hand_pose = data['hand_pose']
+        betas = data['betas']
+        right = data['right']
+        # print(f'right:{right}')
+        has_hand_pose = data['has_hand_pose']
+        has_betas = data['has_betas']
+        other_hand_center = data.get('other_hand_center', None)
+        other_hand_scale = data.get('other_hand_scale', None)
+        # Process bounding boxes
+
+        # Single hand case
+        box_size = scale * 200  # scale is typically normalized, so multiply by 200 to get pixel size
+        x_min = int(center[0] - box_size[0] / 2)
+        x_max = int(center[0] + box_size[0] / 2)
+        y_min = int(center[1] - box_size[1] / 2)
+        y_max = int(center[1] + box_size[1] / 2)
+
+        bbox = [x_min, y_min, x_max, y_max]
+
+        # Process bounding boxes for the other hand (if available)
+        other_hand_bbox = [0,0,0,0]
+        if other_hand_center is not None and other_hand_scale is not None:
+            other_box_size = other_hand_scale * 200
+            other_x_min = int(other_hand_center[0] - other_box_size[0] / 2)
+            other_x_max = int(other_hand_center[0] + other_box_size[0] / 2)
+            other_y_min = int(other_hand_center[1] - other_box_size[1] / 2)
+            other_y_max = int(other_hand_center[1] + other_box_size[1] / 2)
+            other_hand_bbox = [other_x_min, other_y_min, other_x_max, other_y_max]
+        
+
+        # Process data
+        orig_keypoints_2d = keypoints_2d.copy()
+        center_x = center[0]
+        center_y = center[1]
+        bbox_size = expand_to_aspect_ratio(scale*200, target_aspect_ratio=BBOX_SHAPE).max()
+
+        mano_params = {'global_orient': hand_pose[:3],
+                    'hand_pose': hand_pose[3:],
+                    'betas': betas
+                    }
+
+        has_mano_params = {'global_orient': has_hand_pose,
+                        'hand_pose': has_hand_pose,
+                        'betas': has_betas
+                        }
+
+        mano_params_is_axis_angle = {'global_orient': True,
+                                    'hand_pose': True,
+                                    'betas': False
+                                    }
+
+        augm_config = copy.deepcopy(augm_config)
+        # Crop image and (possibly) perform data augmentation
+        img_rgba = np.concatenate([image, mask.astype(np.uint8)[:,:,None]*255], axis=2)
+        # img_rgba = image.copy()
+        img_patch_rgba, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size, trans = get_example(img_rgba,
+                                                                                                        center_x, center_y,
+                                                                                                        bbox_size, bbox_size,
+                                                                                                        keypoints_2d, keypoints_3d,
+                                                                                                        mano_params, has_mano_params,
+                                                                                                        FLIP_KEYPOINT_PERMUTATION,
+                                                                                                        IMG_SIZE, IMG_SIZE,
+                                                                                                        MEAN, STD, train, right, augm_config,
+                                                                                                        is_bgr=False, return_trans=True,
+                                                                                                        use_skimage_antialias=use_skimage_antialias,
+                                                                                                        border_mode=border_mode,
+                                                                                                        )
+        img_patch = img_patch_rgba[:3,:,:]
+        mask_patch = (img_patch_rgba[3,:,:] / 255.0).clip(0,1)
+        if (mask_patch < 0.5).all():
+            mask_patch = np.ones_like(mask_patch)
 
 
+        # 生成并存储单手数据的item
+        item = {}
+        # 判断是左手还是右手
+        hand_type = 'right' if right > 0.5 else 'left'
 
-        # Compute 3D keypoint loss
-        loss_keypoints_2d = self.keypoint_2d_loss(pred_keypoints_2d, gt_keypoints_2d)
-        loss_keypoints_3d = self.keypoint_3d_loss(pred_keypoints_3d, gt_keypoints_3d, pelvis_id=0)
-        # loss_interhand_j_loss = self.interhand_j_loss(pred_keypoints_left, pred_keypoints_right, gt_left_3d, gt_right_3d)
+        item['img'] = img_patch
+        item['mask'] = mask_patch
+        item['keypoints_3d'] = keypoints_3d.astype(np.float32)
+        item['keypoints_2d'] = keypoints_2d.astype(np.float32)
+        item['orig_keypoints_2d'] = orig_keypoints_2d
+        item['box_center'] = center.copy()
+        item['box_size'] = bbox_size
+        item['bbox'] = bbox
+        item['mano_params'] = mano_params
+        item['has_mano_params'] = has_mano_params
+        item['mano_params_is_axis_angle'] = mano_params_is_axis_angle
+        item['_scale'] = scale
+        item['_trans'] = trans
 
-        # Compute loss on MANO parameters
-        loss_mano_params = {}
-        for k, pred in pred_mano_params.items():
-            gt = gt_mano_params[k].view(batch_size, -1)
-            if is_axis_angle[k].all():
-                gt = aa_to_rotmat(gt.reshape(-1, 3)).view(batch_size, -1, 3, 3)
-            has_gt = has_mano_params[k]
-            loss_mano_params[k] = self.mano_parameter_loss(pred.reshape(batch_size, -1), gt.reshape(batch_size, -1), has_gt)
+        item['other_hand_bbox'] = other_hand_bbox
 
-        loss = self.cfg.LOSS_WEIGHTS['KEYPOINTS_3D'] * loss_keypoints_3d+\
-               self.cfg.LOSS_WEIGHTS['KEYPOINTS_2D'] * loss_keypoints_2d+\
-               sum([loss_mano_params[k] * self.cfg.LOSS_WEIGHTS[k.upper()] for k in loss_mano_params])
-            #    self.cfg.LOSS_WEIGHTS['INTERHANDJLOSS'] * loss_interhand_j_loss+\
-
-        losses = dict(loss=loss.detach(),
-                      loss_keypoints_2d=loss_keypoints_2d.detach(),
-                      loss_keypoints_3d=loss_keypoints_3d.detach())
-
-        for k, v in loss_mano_params.items():
-            losses['loss_' + k] = v.detach()
-
-        output['losses'] = losses
-        # print(f'losses:{losses}')
-
-        return loss
-
-    # Tensoroboard logging should run from first rank only
-    @pl.utilities.rank_zero.rank_zero_only
-    def tensorboard_logging(self, batch: Dict, output: Dict, step_count: int, train: bool = True, write_to_summary_writer: bool = True) -> None:
-        """
-        Log results to Tensorboard
-        Args:
-            batch (Dict): Dictionary containing batch data
-            output (Dict): Dictionary containing the regression output
-            step_count (int): Global training step count
-            train (bool): Flag indicating whether it is training or validation mode
-        """
-
-        mode = 'train' if train else 'val'
-        batch_size = batch['keypoints_2d'].shape[0]
-        images = batch['img']
-        images = images * torch.tensor([0.229, 0.224, 0.225], device=images.device).reshape(1,3,1,1)
-        images = images + torch.tensor([0.485, 0.456, 0.406], device=images.device).reshape(1,3,1,1)
-        #images = 255*images.permute(0, 2, 3, 1).cpu().numpy()
-
-        pred_keypoints_3d = output['pred_keypoints_3d'].detach().reshape(batch_size, -1, 3)
-        pred_vertices = output['pred_vertices'].detach().reshape(batch_size, -1, 3)
-        focal_length = output['focal_length'].detach().reshape(batch_size, 2)
-        gt_keypoints_3d = batch['keypoints_3d']
-        gt_keypoints_2d = batch['keypoints_2d']
-        losses = output['losses']
-        pred_cam_t = output['pred_cam_t'].detach().reshape(batch_size, 3)
-        pred_keypoints_2d = output['pred_keypoints_2d'].detach().reshape(batch_size, -1, 2)
-
-        if write_to_summary_writer:
-            summary_writer = self.logger.experiment
-            for loss_name, val in losses.items():
-                summary_writer.add_scalar(mode +'/' + loss_name, val.detach().item(), step_count)
-        num_images = min(batch_size, self.cfg.EXTRA.NUM_LOG_IMAGES)
-
-        gt_keypoints_3d = batch['keypoints_3d']
-        pred_keypoints_3d = output['pred_keypoints_3d'].detach().reshape(batch_size, -1, 3)
-
-        # We render the skeletons instead of the full mesh because rendering a lot of meshes will make the training slow.
-        #predictions = self.renderer(pred_keypoints_3d[:num_images],
-        #                            gt_keypoints_3d[:num_images],
-        #                            2 * gt_keypoints_2d[:num_images],
-        #                            images=images[:num_images],
-        #                            camera_translation=pred_cam_t[:num_images])
-        predictions = self.mesh_renderer.visualize_tensorboard(pred_vertices[:num_images].cpu().numpy(),
-                                                               pred_cam_t[:num_images].cpu().numpy(),
-                                                               images[:num_images].cpu().numpy(),
-                                                               pred_keypoints_2d[:num_images].cpu().numpy(),
-                                                               gt_keypoints_2d[:num_images].cpu().numpy(),
-                                                               focal_length=focal_length[:num_images].cpu().numpy())
-        if write_to_summary_writer:
-            summary_writer.add_image('%s/predictions' % mode, predictions, step_count)
-
-        return predictions
-
-    def forward(self, batch: Dict) -> Dict:
-        """
-        Run a forward step of the network in val mode
-        Args:
-            batch (Dict): Dictionary containing batch data
-        Returns:
-            Dict: Dictionary containing the regression output
-        """
-        return self.forward_step(batch, train=False)
-
-    def training_step_discriminator(self, batch: Dict,
-                                    hand_pose: torch.Tensor,
-                                    betas: torch.Tensor,
-                                    optimizer: torch.optim.Optimizer) -> torch.Tensor:
-        """
-        Run a discriminator training step
-        Args:
-            batch (Dict): Dictionary containing mocap batch data
-            hand_pose (torch.Tensor): Regressed hand pose from current step
-            betas (torch.Tensor): Regressed betas from current step
-            optimizer (torch.optim.Optimizer): Discriminator optimizer
-        Returns:
-            torch.Tensor: Discriminator loss
-        """
-        batch_size = hand_pose.shape[0]
-        gt_hand_pose = batch['hand_pose']
-        gt_betas = batch['betas']
-        gt_rotmat = aa_to_rotmat(gt_hand_pose.view(-1,3)).view(batch_size, -1, 3, 3)
-        disc_fake_out = self.discriminator(hand_pose.detach(), betas.detach())
-        loss_fake = ((disc_fake_out - 0.0) ** 2).sum() / batch_size
-        disc_real_out = self.discriminator(gt_rotmat, gt_betas)
-        loss_real = ((disc_real_out - 1.0) ** 2).sum() / batch_size
-        loss_disc = loss_fake + loss_real
-        loss = self.cfg.LOSS_WEIGHTS.ADVERSARIAL * loss_disc
-        optimizer.zero_grad()
-        self.manual_backward(loss)
-        optimizer.step()
-        return loss_disc.detach()
-
-    def training_step(self, joint_batch: Dict, batch_idx: int) -> Dict:
-        """
-        Run a full training step
-        Args:
-            joint_batch (Dict): Dictionary containing image and mocap batch data
-            batch_idx (int): Unused.
-            batch_idx (torch.Tensor): Unused.
-        Returns:
-            Dict: Dictionary containing regression output.
-        """
-        batch = joint_batch['img']
-        mocap_batch = joint_batch['mocap']
-        optimizer = self.optimizers(use_pl_optimizer=True)
-        if self.cfg.LOSS_WEIGHTS.ADVERSARIAL > 0:
-            optimizer, optimizer_disc = optimizer
-
-        batch_size = batch['img'].shape[0]
-        output = self.forward_step(batch, train=True)
-        pred_mano_params = output['pred_mano_params']
-        if self.cfg.get('UPDATE_GT_SPIN', False):
-            self.update_batch_gt_spin(batch, output)
-        loss = self.compute_loss(batch, output, train=True)
-        # print(f'loss:{loss}')
-        if self.cfg.LOSS_WEIGHTS.ADVERSARIAL > 0:
-            disc_out = self.discriminator(pred_mano_params['hand_pose'].reshape(batch_size, -1), pred_mano_params['betas'].reshape(batch_size, -1))
-            loss_adv = ((disc_out - 1.0) ** 2).sum() / batch_size
-            loss = loss + self.cfg.LOSS_WEIGHTS.ADVERSARIAL * loss_adv
-
-        # Error if Nan
-        if torch.isnan(loss):
-            raise ValueError('Loss is NaN')
-
-        optimizer.zero_grad()
-        self.manual_backward(loss)
-        # Clip gradient
-        if self.cfg.TRAIN.get('GRAD_CLIP_VAL', 0) > 0:
-            gn = torch.nn.utils.clip_grad_norm_(self.get_parameters(), self.cfg.TRAIN.GRAD_CLIP_VAL, error_if_nonfinite=True)
-            self.log('train/grad_norm', gn, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        optimizer.step()
-        if self.cfg.LOSS_WEIGHTS.ADVERSARIAL > 0:
-            loss_disc = self.training_step_discriminator(mocap_batch, pred_mano_params['hand_pose'].reshape(batch_size, -1), pred_mano_params['betas'].reshape(batch_size, -1), optimizer_disc)
-            output['losses']['loss_gen'] = loss_adv
-            output['losses']['loss_disc'] = loss_disc
-
-        if self.global_step > 0 and self.global_step % self.cfg.GENERAL.LOG_STEPS == 0:
-            self.tensorboard_logging(batch, output, self.global_step, train=True)
-
-        self.log('train/loss', output['losses']['loss'], on_step=True, on_epoch=True, prog_bar=True, logger=False)
-
-        return output
-
-    def validation_step(self, batch: Dict, batch_idx: int, dataloader_idx=0) -> Dict:
-        """
-        Run a validation step and log to Tensorboard
-        Args:
-            batch (Dict): Dictionary containing batch data
-            batch_idx (int): Unused.
-        Returns:
-            Dict: Dictionary containing regression output.
-        """
-        # batch_size = batch['img'].shape[0]
-        output = self.forward_step(batch, train=False)
-        loss = self.compute_loss(batch, output, train=False)
-        output['loss'] = loss
-        self.tensorboard_logging(batch, output, self.global_step, train=False)
-
-        return output
+        item['imgname'] = key
+        item['img_size'] = 1.0 * img_size[::-1].copy()
+        item['hand_type'] = hand_type
+        
+        return item
