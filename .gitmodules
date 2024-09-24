@@ -1,0 +1,3 @@
+[submodule "ace-hamer/TARGET_FOLDER"]
+	path = ace-hamer/TARGET_FOLDER
+	url = https://github.com/geopavlakos/hamer.git
